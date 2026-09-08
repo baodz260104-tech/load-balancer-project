@@ -41,7 +41,7 @@ public class JavaLoadBalancer {
         HttpServer server = HttpServer.create(new InetSocketAddress(lbPort), 0);
 
         server.createContext("/", new LoadBalancerHandler());
-        server.setExecutor(Executors.newVirtualThreadPerTaskExecutor()); // Tận dụng Virtual Threads trên JDK mới
+        server.setExecutor(Executors.newFixedThreadPool(50)); // Tận dụng Virtual Threads trên JDK mới
 
         System.out.println(">>> Java Load Balancer đang chạy tại: http://localhost:" + lbPort);
         server.start();
