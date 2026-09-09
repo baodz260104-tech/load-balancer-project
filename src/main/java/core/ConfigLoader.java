@@ -10,18 +10,41 @@ import java.util.List;
 
 public class ConfigLoader {
 
+    public static class BackendConfig {
+        @JsonProperty("url")
+        private String url;
+
+        @JsonProperty("weight")
+        private int weight = 1;
+
+        public String getUrl() {
+            return url;
+        }
+
+        public int getWeight() {
+            return weight;
+        }
+    }
+
     public static class Config {
         @JsonProperty("port")
         private int port;
 
+        @JsonProperty("algorithm")
+        private String algorithm = "weighted_least_conn";
+
         @JsonProperty("backends")
-        private List<String> backends;
+        private List<BackendConfig> backends;
 
         public int getPort() {
             return port;
         }
 
-        public List<String> getBackends() {
+        public String getAlgorithm() {
+            return algorithm;
+        }
+
+        public List<BackendConfig> getBackends() {
             return backends;
         }
     }
@@ -29,13 +52,11 @@ public class ConfigLoader {
     public static Config loadConfig(String fileName) throws IOException {
         ObjectMapper mapper = new ObjectMapper();
 
-        // 1. Uu tien tim trong thu muc resources (Classpath)
         InputStream is = ConfigLoader.class.getClassLoader().getResourceAsStream(fileName);
         if (is != null) {
             return mapper.readValue(is, Config.class);
         }
 
-        // 2. Thu tim truc tiep o thu muc goc cua project
         File file = new File(fileName);
         if (file.exists()) {
             return mapper.readValue(file, Config.class);

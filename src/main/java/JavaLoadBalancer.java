@@ -1,50 +1,61 @@
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
-import core.Backend;
-import core.ConfigLoader;
-import core.HealthChecker;
-import core.RoundRobinBalancer;
+import core.*;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
-import java.net.URL;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
 
 public class JavaLoadBalancer {
-    private static RoundRobinBalancer balancer;
+    private static List<Backend> backendList;
+    private static LoadBalancingStrategy strategy;
+    private static HttpClient httpClient;
     private static final DateTimeFormatter LOG_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
+    private static final int MAX_RETRIES = 2; // Số lần thử lại tối đa sang backend khác nếu lỗi
 
     public static void main(String[] args) throws IOException {
-        // 1. Doc file config.json
         ConfigLoader.Config config = ConfigLoader.loadConfig("config.json");
         int port = config.getPort();
 
-        List<Backend> backendList = config.getBackends().stream()
-                .map(Backend::new)
+        backendList = config.getBackends().stream()
+                .map(b -> new Backend(b.getUrl(), b.getWeight()))
                 .collect(Collectors.toList());
 
-        balancer = new RoundRobinBalancer(backendList);
+        strategy = StrategyFactory.getStrategy(config.getAlgorithm());
 
-        // 2. Bat Health Checker chay ngam dinh ky moi 5 giay
+        // Khởi tạo HTTP Client dùng chung với Connection Pool & Keep-Alive cho Java 17
+        httpClient = HttpClient.newBuilder()
+                .version(HttpClient.Version.HTTP_1_1)
+                .connectTimeout(Duration.ofSeconds(2))
+                .executor(Executors.newFixedThreadPool(50))
+                .build();
+
         HealthChecker healthChecker = new HealthChecker(backendList);
         healthChecker.start(5);
 
-        // 3. Khoi tao HTTP Server lang nghe tren cong duoc cau hinh
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
         server.createContext("/", new ProxyHandler());
-        server.setExecutor(Executors.newFixedThreadPool(50));
+        server.setExecutor(Executors.newFixedThreadPool(100));
 
         System.out.println("=================================================");
-        System.out.println(">>> Load Balancer dang chay tai: http://localhost:" + port);
-        System.out.println(">>> So luong backend duoc cau hinh: " + backendList.size());
+        System.out.println(">>> Load Balancer running at: http://localhost:" + port);
+        System.out.println(">>> Engine: Java HttpClient (Keep-Alive + Pool)");
+        System.out.println(">>> Algorithm: " + config.getAlgorithm());
+        System.out.println(">>> Backends: " + backendList.size());
         System.out.println("=================================================");
 
         server.start();
@@ -57,77 +68,103 @@ public class JavaLoadBalancer {
             String method = exchange.getRequestMethod();
             String uri = exchange.getRequestURI().toString();
             String clientIp = exchange.getRemoteAddress().getAddress().getHostAddress();
+            byte[] requestBody = exchange.getRequestBody().readAllBytes();
 
-            Backend targetBackend = balancer.getNextBackend();
+            Set<Backend> triedBackends = new HashSet<>();
+            HttpResponse<byte[]> response = null;
+            Backend selectedBackend = null;
+            int attempts = 0;
 
-            // Neu tat ca backend deu chet hoac khong co backend nao kha dung
-            if (targetBackend == null) {
-                byte[] response = "503 Service Unavailable: Tat ca backend deu offline".getBytes();
-                exchange.sendResponseHeaders(503, response.length);
-                try (OutputStream os = exchange.getResponseBody()) {
-                    os.write(response);
+            // Vòng lặp Retry: nếu backend bị lỗi mạng hoặc sập đột ngột, tự động chuyển sang backend khác
+            while (attempts <= MAX_RETRIES) {
+                // Lọc bỏ những backend đã thử và thất bại trong lượt request này
+                List<Backend> availableBackends = backendList.stream()
+                        .filter(b -> !triedBackends.contains(b))
+                        .collect(Collectors.toList());
+
+                selectedBackend = strategy.selectBackend(availableBackends, clientIp);
+
+                if (selectedBackend == null) {
+                    break;
                 }
-                long duration = System.currentTimeMillis() - startTime;
-                printLog(clientIp, method, uri, "NONE", 503, duration);
-                return;
+
+                triedBackends.add(selectedBackend);
+                selectedBackend.incrementConnections();
+
+                try {
+                    URI targetUri = URI.create(selectedBackend.getUrl() + uri);
+
+                    HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
+                            .uri(targetUri)
+                            .timeout(Duration.ofSeconds(3))
+                            .header("X-Forwarded-For", clientIp);
+
+                    // Forward headers từ client (trừ restricted headers)
+                    for (String headerKey : exchange.getRequestHeaders().keySet()) {
+                        if (!isRestrictedHeader(headerKey)) {
+                            for (String val : exchange.getRequestHeaders().get(headerKey)) {
+                                requestBuilder.header(headerKey, val);
+                            }
+                        }
+                    }
+
+                    // Đính kèm Body nếu có
+                    if (requestBody.length > 0) {
+                        requestBuilder.method(method, HttpRequest.BodyPublishers.ofByteArray(requestBody));
+                    } else {
+                        requestBuilder.method(method, HttpRequest.BodyPublishers.noBody());
+                    }
+
+                    response = httpClient.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofByteArray());
+
+                    // Thành công nhận phản hồi từ backend
+                    break;
+
+                } catch (Exception ex) {
+                    // Backend đột ngột timeout hoặc connection refused
+                    selectedBackend.setAlive(false); // Tạm thời cô lập backend
+                    System.err.printf("[WARN] Backend %s failed: %s. Dang thu lai backend khac...%n",
+                            selectedBackend.getUrl(), ex.getMessage());
+                    attempts++;
+                } finally {
+                    selectedBackend.decrementConnections();
+                }
             }
 
-            targetBackend.incrementConnections();
-            int responseCode = 502;
-
-            try {
-                // Forward request sang backend
-                URL targetUrl = new URL(targetBackend.getUrl() + uri);
-                HttpURLConnection conn = (HttpURLConnection) targetUrl.openConnection();
-                conn.setRequestMethod(method);
-                conn.setConnectTimeout(3000);
-                conn.setReadTimeout(5000);
-
-                // Copy Request Headers
-                for (String headerKey : exchange.getRequestHeaders().keySet()) {
-                    if (headerKey != null && !headerKey.equalsIgnoreCase("Host")) {
-                        conn.setRequestProperty(headerKey, exchange.getRequestHeaders().getFirst(headerKey));
+            // Phản hồi về Client
+            if (response != null) {
+                // Copy headers từ backend response về client
+                response.headers().map().forEach((key, values) -> {
+                    if (!key.equalsIgnoreCase("Transfer-Encoding") && !key.equalsIgnoreCase("Content-Length")) {
+                        for (String val : values) {
+                            exchange.getResponseHeaders().add(key, val);
+                        }
                     }
-                }
-                conn.setRequestProperty("X-Forwarded-For", clientIp);
+                });
 
-                // Copy Body neu la POST/PUT
-                if (exchange.getRequestBody().available() > 0) {
-                    conn.setDoOutput(true);
-                    try (InputStream is = exchange.getRequestBody(); OutputStream os = conn.getOutputStream()) {
-                        is.transferTo(os);
-                    }
-                }
-
-                responseCode = conn.getResponseCode();
-
-                // Copy Response Headers ve Client
-                for (String key : conn.getHeaderFields().keySet()) {
-                    if (key != null && !key.equalsIgnoreCase("Transfer-Encoding")) {
-                        exchange.getResponseHeaders().set(key, conn.getHeaderField(key));
-                    }
-                }
-
-                InputStream respStream = (responseCode >= 400) ? conn.getErrorStream() : conn.getInputStream();
-                byte[] body = (respStream != null) ? respStream.readAllBytes() : new byte[0];
-
-                exchange.sendResponseHeaders(responseCode, body.length);
+                byte[] body = response.body();
+                exchange.sendResponseHeaders(response.statusCode(), body.length);
                 try (OutputStream os = exchange.getResponseBody()) {
                     os.write(body);
                 }
+                printLog(clientIp, method, uri, selectedBackend.getUrl(), response.statusCode(), System.currentTimeMillis() - startTime);
 
-            } catch (Exception e) {
-                responseCode = 502;
-                byte[] errorMsg = ("502 Bad Gateway: " + e.getMessage()).getBytes();
-                exchange.sendResponseHeaders(502, errorMsg.length);
+            } else {
+                byte[] errorMsg = "503 Service Unavailable: Tat ca backend deu ban hoac gap su co".getBytes();
+                exchange.sendResponseHeaders(503, errorMsg.length);
                 try (OutputStream os = exchange.getResponseBody()) {
                     os.write(errorMsg);
                 }
-            } finally {
-                targetBackend.decrementConnections();
-                long duration = System.currentTimeMillis() - startTime;
-                printLog(clientIp, method, uri, targetBackend.getUrl(), responseCode, duration);
+                String backendUrl = selectedBackend != null ? selectedBackend.getUrl() : "NONE";
+                printLog(clientIp, method, uri, backendUrl, 503, System.currentTimeMillis() - startTime);
             }
+        }
+
+        private boolean isRestrictedHeader(String header) {
+            return header == null ||
+                    header.equalsIgnoreCase("Host") ||
+                    header.equalsIgnoreCase("Connection") ||
+                    header.equalsIgnoreCase("Content-Length");
         }
 
         private void printLog(String clientIp, String method, String uri, String backendUrl, int statusCode, long duration) {
