@@ -1,3 +1,5 @@
+import core.Backend;
+import core.RoundRobinBalancer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -9,35 +11,38 @@ import static org.junit.jupiter.api.Assertions.*;
 public class RoundRobinBalancerTest {
 
     private RoundRobinBalancer balancer;
-    private List<String> fixtureServers;
+    private List<Backend> fixtureServers;
 
-    // Fixture: khoi tao lai tap server mau truoc moi ca test
     @BeforeEach
     void setUp() {
         fixtureServers = List.of(
-                "http://localhost:8081",
-                "http://localhost:8082",
-                "http://localhost:8083",
-                "http://localhost:8084"
+                new Backend("http://localhost:8081"),
+                new Backend("http://localhost:8082"),
+                new Backend("http://localhost:8083"),
+                new Backend("http://localhost:8084")
         );
         balancer = new RoundRobinBalancer(fixtureServers);
     }
 
     @Test
-    @DisplayName("Kiem tra xoay vong server theo dung thu tu 1 -> 2 -> 3 -> 4 -> 1")
+    @DisplayName("Kiem tra xoay vong server binh thuong khi tat ca deu song")
     void testRoundRobinOrder() {
-        assertEquals("http://localhost:8081", balancer.getNextServer());
-        assertEquals("http://localhost:8082", balancer.getNextServer());
-        assertEquals("http://localhost:8083", balancer.getNextServer());
-        assertEquals("http://localhost:8084", balancer.getNextServer());
-
-        // Quay vong lai server dau tien
-        assertEquals("http://localhost:8081", balancer.getNextServer());
+        assertEquals("http://localhost:8081", balancer.getNextBackend().getUrl());
+        assertEquals("http://localhost:8082", balancer.getNextBackend().getUrl());
+        assertEquals("http://localhost:8083", balancer.getNextBackend().getUrl());
+        assertEquals("http://localhost:8084", balancer.getNextBackend().getUrl());
+        assertEquals("http://localhost:8081", balancer.getNextBackend().getUrl());
     }
 
     @Test
-    @DisplayName("Nem ra ngoai le IllegalArgumentException khi danh sach server rong")
-    void testEmptyServerListThrowsException() {
-        assertThrows(IllegalArgumentException.class, () -> new RoundRobinBalancer(List.of()));
+    @DisplayName("Bo qua server chet va chi phan phoi toi server con song")
+    void testSkipDeadServer() {
+        // Danh dau server 8082 bi chet
+        fixtureServers.get(1).setAlive(false);
+
+        assertEquals("http://localhost:8081", balancer.getNextBackend().getUrl());
+        assertEquals("http://localhost:8083", balancer.getNextBackend().getUrl()); // Nhay qua 8082
+        assertEquals("http://localhost:8084", balancer.getNextBackend().getUrl());
+        assertEquals("http://localhost:8081", balancer.getNextBackend().getUrl());
     }
 }

@@ -1,118 +1,139 @@
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
+import core.Backend;
+import core.ConfigLoader;
+import core.HealthChecker;
+import core.RoundRobinBalancer;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
+import java.net.URL;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
-import java.util.Set;
 import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 public class JavaLoadBalancer {
-
-    private static final List<String> BACKENDS = List.of(
-            "http://localhost:8081",
-            "http://localhost:8082",
-            "http://localhost:8083"
-    );
-
-    private static final AtomicInteger counter = new AtomicInteger(0);
-
-    private static final HttpClient httpClient = HttpClient.newBuilder()
-            .version(HttpClient.Version.HTTP_1_1)
-            .connectTimeout(Duration.ofSeconds(3))
-            .build();
-
-    // Danh sách header không được forward thủ công để tránh xung đột HTTP client/server
-    private static final Set<String> HOP_BY_HOP_HEADERS = Set.of(
-            "host", "connection", "content-length", "transfer-encoding",
-            "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "upgrade"
-    );
+    private static RoundRobinBalancer balancer;
+    private static final DateTimeFormatter LOG_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
 
     public static void main(String[] args) throws IOException {
-        int lbPort = 8000;
-        HttpServer server = HttpServer.create(new InetSocketAddress(lbPort), 0);
+        // 1. Doc file config.json
+        ConfigLoader.Config config = ConfigLoader.loadConfig("config.json");
+        int port = config.getPort();
 
-        server.createContext("/", new LoadBalancerHandler());
-        server.setExecutor(Executors.newFixedThreadPool(50)); // Tận dụng Virtual Threads trên JDK mới
+        List<Backend> backendList = config.getBackends().stream()
+                .map(Backend::new)
+                .collect(Collectors.toList());
 
-        System.out.println(">>> Java Load Balancer đang chạy tại: http://localhost:" + lbPort);
+        balancer = new RoundRobinBalancer(backendList);
+
+        // 2. Bat Health Checker chay ngam dinh ky moi 5 giay
+        HealthChecker healthChecker = new HealthChecker(backendList);
+        healthChecker.start(5);
+
+        // 3. Khoi tao HTTP Server lang nghe tren cong duoc cau hinh
+        HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
+        server.createContext("/", new ProxyHandler());
+        server.setExecutor(Executors.newFixedThreadPool(50));
+
+        System.out.println("=================================================");
+        System.out.println(">>> Load Balancer dang chay tai: http://localhost:" + port);
+        System.out.println(">>> So luong backend duoc cau hinh: " + backendList.size());
+        System.out.println("=================================================");
+
         server.start();
     }
 
-    static class LoadBalancerHandler implements HttpHandler {
+    static class ProxyHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            // 1. Chọn Backend theo Round Robin
-            int index = Math.abs(counter.getAndIncrement() % BACKENDS.size());
-            String targetHost = BACKENDS.get(index);
-            String fullTargetUrl = targetHost + exchange.getRequestURI().toString();
+            long startTime = System.currentTimeMillis();
+            String method = exchange.getRequestMethod();
+            String uri = exchange.getRequestURI().toString();
+            String clientIp = exchange.getRemoteAddress().getAddress().getHostAddress();
+
+            Backend targetBackend = balancer.getNextBackend();
+
+            // Neu tat ca backend deu chet hoac khong co backend nao kha dung
+            if (targetBackend == null) {
+                byte[] response = "503 Service Unavailable: Tat ca backend deu offline".getBytes();
+                exchange.sendResponseHeaders(503, response.length);
+                try (OutputStream os = exchange.getResponseBody()) {
+                    os.write(response);
+                }
+                long duration = System.currentTimeMillis() - startTime;
+                printLog(clientIp, method, uri, "NONE", 503, duration);
+                return;
+            }
+
+            targetBackend.incrementConnections();
+            int responseCode = 502;
 
             try {
-                // 2. Chuẩn bị request gửi sang backend
-                byte[] requestBody = exchange.getRequestBody().readAllBytes();
-                HttpRequest.BodyPublisher bodyPublisher = requestBody.length > 0
-                        ? HttpRequest.BodyPublishers.ofByteArray(requestBody)
-                        : HttpRequest.BodyPublishers.noBody();
+                // Forward request sang backend
+                URL targetUrl = new URL(targetBackend.getUrl() + uri);
+                HttpURLConnection conn = (HttpURLConnection) targetUrl.openConnection();
+                conn.setRequestMethod(method);
+                conn.setConnectTimeout(3000);
+                conn.setReadTimeout(5000);
 
-                HttpRequest.Builder reqBuilder = HttpRequest.newBuilder()
-                        .uri(URI.create(fullTargetUrl))
-                        .method(exchange.getRequestMethod(), bodyPublisher)
-                        .timeout(Duration.ofSeconds(5));
-
-                exchange.getRequestHeaders().forEach((key, values) -> {
-                    if (!HOP_BY_HOP_HEADERS.contains(key.toLowerCase())) {
-                        for (String value : values) {
-                            reqBuilder.header(key, value);
-                        }
+                // Copy Request Headers
+                for (String headerKey : exchange.getRequestHeaders().keySet()) {
+                    if (headerKey != null && !headerKey.equalsIgnoreCase("Host")) {
+                        conn.setRequestProperty(headerKey, exchange.getRequestHeaders().getFirst(headerKey));
                     }
-                });
+                }
+                conn.setRequestProperty("X-Forwarded-For", clientIp);
 
-                reqBuilder.header("X-Forwarded-For", exchange.getRemoteAddress().getAddress().getHostAddress());
-
-                // 3. Nhận phản hồi từ Backend dưới dạng mảng byte
-                HttpResponse<byte[]> response = httpClient.send(
-                        reqBuilder.build(),
-                        HttpResponse.BodyHandlers.ofByteArray()
-                );
-
-                byte[] responseBytes = response.body();
-
-                // 4. Ghi header phản hồi về Client
-                response.headers().map().forEach((key, values) -> {
-                    if (!HOP_BY_HOP_HEADERS.contains(key.toLowerCase())) {
-                        for (String value : values) {
-                            exchange.getResponseHeaders().add(key, value);
-                        }
+                // Copy Body neu la POST/PUT
+                if (exchange.getRequestBody().available() > 0) {
+                    conn.setDoOutput(true);
+                    try (InputStream is = exchange.getRequestBody(); OutputStream os = conn.getOutputStream()) {
+                        is.transferTo(os);
                     }
-                });
+                }
 
-                // Xác định chính xác độ dài byte trả về
-                exchange.sendResponseHeaders(response.statusCode(), responseBytes.length);
+                responseCode = conn.getResponseCode();
+
+                // Copy Response Headers ve Client
+                for (String key : conn.getHeaderFields().keySet()) {
+                    if (key != null && !key.equalsIgnoreCase("Transfer-Encoding")) {
+                        exchange.getResponseHeaders().set(key, conn.getHeaderField(key));
+                    }
+                }
+
+                InputStream respStream = (responseCode >= 400) ? conn.getErrorStream() : conn.getInputStream();
+                byte[] body = (respStream != null) ? respStream.readAllBytes() : new byte[0];
+
+                exchange.sendResponseHeaders(responseCode, body.length);
                 try (OutputStream os = exchange.getResponseBody()) {
-                    os.write(responseBytes);
-                    os.flush();
+                    os.write(body);
                 }
 
             } catch (Exception e) {
-                e.printStackTrace();
-                String errorMsg = "502 Bad Gateway: " + e.getMessage();
-                byte[] errorBytes = errorMsg.getBytes();
-                exchange.sendResponseHeaders(502, errorBytes.length);
+                responseCode = 502;
+                byte[] errorMsg = ("502 Bad Gateway: " + e.getMessage()).getBytes();
+                exchange.sendResponseHeaders(502, errorMsg.length);
                 try (OutputStream os = exchange.getResponseBody()) {
-                    os.write(errorBytes);
-                    os.flush();
+                    os.write(errorMsg);
                 }
             } finally {
-                exchange.close();
+                targetBackend.decrementConnections();
+                long duration = System.currentTimeMillis() - startTime;
+                printLog(clientIp, method, uri, targetBackend.getUrl(), responseCode, duration);
             }
+        }
+
+        private void printLog(String clientIp, String method, String uri, String backendUrl, int statusCode, long duration) {
+            String timestamp = LocalDateTime.now().format(LOG_DATE_FORMAT);
+            System.out.printf("[%s] %s | %s %s -> %s | Status: %d | Duration: %d ms%n",
+                    timestamp, clientIp, method, uri, backendUrl, statusCode, duration);
         }
     }
 }
